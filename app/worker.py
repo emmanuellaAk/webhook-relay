@@ -1,4 +1,3 @@
-# worker.py
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
@@ -13,11 +12,11 @@ from app.models import Event, EventStatus
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("worker")
 
-POLL_INTERVAL = 2
-BATCH_SIZE = 10
+POLL_INTERVAL = 2          # seconds between checks of the notebook
+BATCH_SIZE = 10            # max events claimed per cycle
 MAX_ATTEMPTS = 5
-BACKOFF_SCHEDULE = [30, 120, 600, 3600]
-STALE_CLAIM_SECONDS = 300
+BACKOFF_SCHEDULE = [30, 120, 600, 3600]   # seconds: 30s, 2min, 10min, 1hr
+STALE_CLAIM_SECONDS = 300   # a claim older than this = its worker is dead
 
 
 def next_retry_delay(attempts: int) -> int:

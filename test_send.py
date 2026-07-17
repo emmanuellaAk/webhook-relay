@@ -10,7 +10,7 @@ from app.config import settings
 SECRET = settings.demo_webhook_secret.encode()
 
 body = json.dumps(
-    {"id": "evt_002", "type": "payment.succeeded", "amount": 5000}
+    {"id": "evt_005", "type": "payment.succeeded", "amount": 5000}
 ).encode()
 
 sig = hmac.new(SECRET, body, hashlib.sha256).hexdigest()

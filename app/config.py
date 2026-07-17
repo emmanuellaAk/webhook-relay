@@ -10,5 +10,4 @@ class Settings(BaseSettings):
 
     demo_destination_url: str = "https://webhook.site/4cfd6297-eecb-43e9-aec1-c480e19abb5d"
 
-
 settings = Settings()
