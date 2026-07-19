@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
+from app.transformer import render_template
 
 import httpx
 from sqlalchemy import select
@@ -60,11 +61,14 @@ async def claim_events(session) -> list[Event]:
 
 
 async def deliver(client: httpx.AsyncClient, event: Event) -> None:
-    url = DESTINATIONS.get(event.source)
-    if url is None:
+    dest = DESTINATIONS.get(event.source)
+    if dest is None:
         raise RuntimeError(f"No destination configured for source {event.source!r}")
 
-    response = await client.post(url, json=event.payload, timeout=10.0)
+    transform = dest.get("transform")
+    body = render_template(transform, event.payload) if transform else event.payload
+
+    response = await client.post(dest["url"], json=body, timeout=10.0)
     response.raise_for_status()
 
 

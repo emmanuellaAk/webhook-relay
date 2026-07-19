@@ -8,6 +8,7 @@ from sqlalchemy import select
 
 from app.db import SessionLocal
 from app.destinations import DESTINATIONS
+from app.transformer import render_template
 from app.models import Event, EventStatus
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -61,11 +62,14 @@ async def claim_events(session) -> list[Event]:
 
 
 async def deliver(client: httpx.AsyncClient, event: Event) -> None:
-    url = DESTINATIONS.get(event.source)
-    if url is None:
+    dest = DESTINATIONS.get(event.source)
+    if dest is None:
         raise RuntimeError(f"No destination configured for source {event.source!r}")
 
-    response = await client.post(url, json=event.payload, timeout=10.0)
+    transform = dest.get("transform")
+    body = render_template(transform, event.payload) if transform else event.payload
+
+    response = await client.post(dest["url"], json=body, timeout=10.0)
     response.raise_for_status()
 
 

@@ -1,0 +1,5 @@
+{
+  "text": "New payment {{id}} received",
+  "amount": "{{amount}}",
+  "type": "{{type}}"
+}
