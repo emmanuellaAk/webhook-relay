@@ -86,7 +86,7 @@ async def replay_event(event_id: int):
         if event.status != EventStatus.failed:
             raise HTTPException(
                 status_code=409,
-                detail=f"Only failed events can be replayed (this one is {event.status})",
+                detail=f"Only failed events can be replayed (this one is {event.status.value})",
             )
 
         event.status = EventStatus.pending
