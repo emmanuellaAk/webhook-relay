@@ -96,3 +96,7 @@ async def replay_event(event_id: int):
         await session.commit()
 
         return {"status": "replaying", "id": event.id}
+    
+@app.get("/")
+async def root():
+    return {"service": "webhook-relay", "status": "ok", "docs": "/docs"}
