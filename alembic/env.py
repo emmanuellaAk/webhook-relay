@@ -74,6 +74,8 @@ async def run_async_migrations() -> None:
     section = config.get_section(config.config_ini_section, {})
     _env_url = _os.environ.get("DATABASE_URL")
     if _env_url:
+        if _env_url.startswith("postgresql://"):
+            _env_url = _env_url.replace("postgresql://", "postgresql+asyncpg://", 1)
         section["sqlalchemy.url"] = _env_url
     connectable = async_engine_from_config(
         section,

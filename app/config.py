@@ -10,3 +10,19 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+# Render (and some hosts) provide DATABASE_URL as postgresql://
+# but the async app needs postgresql+asyncpg://
+if settings.database_url.startswith("postgresql://"):
+    settings.database_url = settings.database_url.replace(
+        "postgresql://", "postgresql+asyncpg://", 1
+    )
+
+
+# Render provides DATABASE_URL as postgresql://, but the async app
+# needs the asyncpg driver. Normalize it here.
+if settings.database_url.startswith("postgresql://"):
+    settings.database_url = settings.database_url.replace(
+        "postgresql://", "postgresql+asyncpg://", 1
+    )
