@@ -1,22 +1,20 @@
 # Webhook Relay & Transformer
 
-A reliable middleman for webhooks. It sits between webhook *senders* (Stripe, Shopify, GitHub) and your *destinations* (Slack, a CRM, an internal API), and guarantees that no event is ever silently lost — even when your destination is down, the same event arrives twice, or the relay itself crashes mid-delivery.
+A middleman that sits between webhook senders (Stripe, Shopify, GitHub) and wherever you actually want the data to go (Slack, a CRM, some internal API). Its whole job is to make sure a webhook never gets silently lost — not when the destination is down, not when the same event shows up twice, not even when the relay itself crashes halfway through a delivery.
 
----
+**Live:** https://relay-api-p2pp.onrender.com — `/events` shows what's been received, `/docs` has the interactive API. It's on a free tier, so the first request after it's been idle takes ~40 seconds to wake up. Just give it a moment.
 
-## The problem
+## Why this exists
 
-Most teams wire webhook senders directly into their own systems. That works until it doesn't:
+Most teams point Stripe (or whatever) straight at their own server and call it done. That's fine right up until one of these happens:
 
-- **The destination is down for 30 seconds.** The webhook fires during those 30 seconds, the delivery fails, and the event is gone forever. A customer paid but never got their confirmation.
-- **The sender retries and sends a duplicate.** Naive handlers process it twice — two confirmation emails, two records, a double refund.
-- **The receiving process crashes halfway through.** Was the event delivered or not? Nobody knows, and there's no way to find out.
+- Your server is down for thirty seconds, Stripe fires a webhook during those thirty seconds, and now that event is just gone. The customer paid; they never got the email.
+- Stripe sends the same event twice (it does this on purpose, to be safe). If you're not careful you charge-notify the customer twice, or write two records.
+- Your process dies mid-request. Did the event get delivered or not? No way to tell after the fact.
 
-This relay solves all three by decoupling *receiving* from *delivering*. Incoming webhooks are persisted immediately and acknowledged in milliseconds; a separate worker delivers them asynchronously, retrying on failure, and never drops anything.
+The relay fixes all three by refusing to do the delivery inline. When a webhook comes in, it gets written down and acknowledged immediately — that's it. A separate worker handles actually delivering it, retrying when things fail. Receiving and delivering are two different jobs, and keeping them apart is the whole trick.
 
----
-
-## Architecture
+## How it's put together
 
 ```mermaid
 flowchart LR
@@ -26,103 +24,101 @@ flowchart LR
     W -->|delivers| D["Destinations<br/>Slack, CRM, any API"]
 ```
 
-The ingest endpoint's only job is to authenticate, deduplicate, and write the event down — then say "got it" in a few milliseconds. It never calls the destination. A separate worker process reads the store and handles delivery. This separation is what makes the system reliable: a slow or dead destination can never block or lose an incoming webhook.
+The ingest endpoint authenticates the sender, checks it's not a duplicate, writes the event to Postgres, and returns 200 — all in a few milliseconds. It never calls the destination itself. The worker picks up stored events separately and delivers them. Because of that split, a dead or slow destination can't block incoming webhooks or cause one to be dropped.
 
----
+## The decisions that actually matter
 
-## Design decisions
+**Postgres is the queue.** No Redis, no RabbitMQ. A single table with `SELECT ... FOR UPDATE SKIP LOCKED` does the job at any volume a webhook relay realistically sees, and it means the queue, the audit log, and the dead-letter pile are all just the same table filtered by a `status` column. `SKIP LOCKED` is what lets two workers run at once without ever grabbing the same row. One less service to run, and no gap between "the queue" and "the record of what happened" — they're literally the same rows.
 
-These are the choices that matter, and the reasoning behind each.
+**At-least-once delivery.** You can't actually guarantee exactly-once in a system where a process might die between "the HTTP call worked" and "I saved that it worked." So you pick your poison. This picks at-least-once — better to occasionally deliver twice than to ever lose one, since for webhooks a silent loss is the worst outcome. The duplicates that result get caught at the front door by a unique constraint on `(source, external_id)`, enforced by Postgres itself, so even two identical webhooks landing in the same millisecond can't both make it in.
 
-### Postgres as the queue — not Redis or RabbitMQ
+**Crash recovery through leases.** When the worker grabs an event it stamps the time and marks it `delivering`. That's a lease, not ownership. If the worker gets `kill -9`'d or the box loses power mid-delivery, nothing cleans up and the row is stuck at `delivering` forever. So every cycle the worker first sweeps for `delivering` rows that have been sitting too long, and throws them back on the queue. Same idea as SQS's visibility timeout. This is the part that makes it survive real crashes and not just tidy errors.
 
-At realistic webhook volumes, a single Postgres table backed by `SELECT ... FOR UPDATE SKIP LOCKED` is a completely sufficient queue, and it collapses three concerns into one store: the pending queue, the audit log, and the dead-letter queue are all just rows with different `status` values. `SKIP LOCKED` lets multiple workers claim disjoint sets of events concurrently without ever grabbing the same row. The payoff is one fewer piece of infrastructure to deploy, monitor, and reason about — and no consistency gap between "the queue" and "the record of what happened."
+**Backoff lives in the database, not in memory.** A failed delivery writes its next retry time into the row (30s, then 2min, then 10min, then an hour), and the claim query just skips anything not due yet. Kill the worker and restart it — all the retry timing is still there, because it was never in memory to begin with.
 
-### At-least-once delivery, and dedupe at the edge
+**Transforms are config, not code.** Senders and destinations want different shapes. Instead of writing delivery code per destination, there's a JSON template with `{{dotted.path}}` placeholders that get filled from the stored payload. New destination format = new template file. Whole-value placeholders keep their type (a number stays a number, not `"5000"`), and a missing field just comes out blank instead of blowing up.
 
-Exactly-once delivery is effectively impossible in a distributed system: if a process can crash between "the HTTP call succeeded" and "I recorded that it succeeded," you must choose which failure you prefer. This relay chooses **at-least-once** — it would rather deliver twice than lose an event, because for webhooks a silent loss is the worse outcome. Duplicates are then absorbed at ingest by a unique constraint on `(source, external_id)`, enforced by the database itself so that even two duplicate webhooks arriving in the same millisecond can't both be stored.
+## Proving it works
 
-### Crash recovery via lease expiry
+Each failure mode does something you can actually watch happen:
 
-When a worker claims an event it stamps `claimed_at` and sets status to `delivering` — think of it as a lease, not permanent ownership. If the worker dies mid-delivery (`kill -9`, power loss, OOM), no cleanup code runs and the row is stranded at `delivering`. A sweep at the top of each worker cycle finds any `delivering` row whose lease has expired (older than a timeout) and returns it to `pending`. This is the same "visibility timeout" pattern used by SQS, and it's what makes the system survive hard crashes rather than just graceful errors.
+- **Destination down** → retries with backoff, then delivers itself once the destination is back, no button-pushing
+- **Duplicate** → rejected by the unique constraint, sender gets a calm 200
+- **Tampered payload** → HMAC check fails, 401
+- **Worker dies mid-delivery** → the lease expires and the event comes back around
+- **Gives up after 5 tries** → lands in the dead-letter pile, where you can inspect it and replay by hand
 
-### Exponential backoff stored in the data
+## API
 
-Retry timing lives in the row (`next_retry_at`, `attempts`), not in worker memory. A failed delivery schedules its next attempt (30s → 2min → 10min → 1hr) by writing a future timestamp; the claim query simply ignores events whose retry time hasn't arrived. Because the schedule is persisted, restarting the worker preserves all in-flight retry timing — nothing resets.
+- `POST /hooks/{source}` — take in a webhook (verify, dedupe, store)
+- `GET /events?status=failed` — list events, filter by status
+- `POST /events/{id}/replay` — put a failed event back on the queue
 
-### Config-driven transformation
+Replay is deliberately dumb: it just flips a failed event back to `pending` and lets the normal worker pick it up. There's no separate redelivery path. It won't touch anything that isn't `failed` (you get a 409), so you can't accidentally re-send something that already went through.
 
-Senders and destinations speak different shapes. The relay reshapes payloads using JSON templates with `{{dotted.path}}` placeholders, resolved against the stored payload. Adding a new destination format is a new template file — not new code, not a redeploy. Templates preserve types for whole-value substitutions (a number stays a number) and degrade gracefully on missing fields rather than crashing.
+## Tests
 
----
+```bash
+pytest -v
+```
 
-## Reliability, demonstrated
-
-Every failure mode has a corresponding behaviour you can trigger and watch:
-
-| Failure | What happens |
-|---|---|
-| Destination down | Event retries with exponential backoff, then self-heals when the destination recovers — no intervention |
-| Duplicate webhook | Rejected at ingest by the unique constraint; sender gets a calm `200`, no double delivery |
-| Tampered payload | HMAC verification fails, request rejected with `401` |
-| Worker crash mid-delivery | Event's lease expires and it's returned to the queue on the next cycle |
-| Permanent failure | After max attempts, event moves to the dead-letter queue for inspection and manual replay |
-
----
-
-## Admin API
-
-| Method | Route | Purpose |
-|---|---|---|
-| `POST` | `/hooks/{source}` | Ingest a webhook (verify, dedupe, persist) |
-| `GET` | `/events?status=failed` | List events, optionally filtered by status |
-| `POST` | `/events/{id}/replay` | Return a failed event to the queue for redelivery |
-
-Replay resets the event to a clean `pending` state and lets the existing worker do the rest — no separate redelivery path. It refuses to replay anything that isn't `failed` (returns `409`), preventing accidental duplicate deliveries of healthy events.
-
----
+Three tests, covering the things that would actually be embarrassing if they broke: a tampered payload gets rejected, the unique constraint really does stop duplicates at the database level, and a normal signed webhook goes through.
 
 ## Stack
 
-Python · FastAPI · PostgreSQL · SQLAlchemy 2.0 (async) · asyncpg · Alembic · httpx · Pydantic · Docker
+Python, FastAPI, Postgres, SQLAlchemy 2.0 (async), asyncpg, Alembic, httpx, Pydantic, Docker. On purpose there's no Redis, no Celery, no broker — the reliability is supposed to come from the design, not from stacking more moving parts.
 
-Deliberately minimal — no Redis, no Celery, no message broker. The reliability comes from design, not dependencies.
-
----
-
-## Running locally
+## Running it locally
 
 ```bash
-# 1. Start Postgres
-docker compose up -d
+# start just Postgres
+docker compose up -d db
 
-# 2. Set up the environment
+# environment
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# 3. Create the schema
+# config — copy the example and fill in your own values
+cp .env.example .env
+
+# schema
 alembic upgrade head
 
-# 4. Run the two processes (separate terminals)
-uvicorn app.main:app --reload      # the ingest API
-python worker.py                    # the delivery worker
+# then run both processes, one per terminal
+uvicorn app.main:app --reload
+python worker.py
 ```
 
-Configuration (database URL, signing secrets, destination URLs) is read from environment variables via a `.env` file — see `.env.example`.
+Or just bring the whole thing up in containers at once:
 
----
+```bash
+docker compose up --build
+```
 
-## Project layout
+Config (database URL, signing secret, destination URL) comes from environment variables — see `.env.example`.
+
+## A note on the deployment
+
+It's on Render — a Docker web service plus a managed Postgres.
+
+One thing I'd do differently with a budget: ideally the worker runs as its own separate process, which is exactly how the local `docker-compose.yml` sets it up — API and worker in separate containers so they can fail and scale independently. Render's free tier doesn't do standalone background workers, so in the deployed version the worker runs inside the same container as the API (see `start.sh`). It's a compromise for a free demo, not how I'd ship it for real. Splitting them back apart is already done in the compose file.
+
+## Layout
 
 ```
 app/
-  main.py           ingest endpoint + admin API
-  models.py         the events table (queue + audit + DLQ)
-  sources.py        per-sender adapters: signature scheme, ID extraction
-  destinations.py   per-destination URL + transform mapping
-  transformer.py    the {{placeholder}} template engine
-  db.py, config.py  connection and settings
-worker.py           the delivery worker (separate process)
-transforms/         JSON transform templates (config, not code)
-alembic/            versioned database migrations
+  main.py           ingest + admin endpoints
+  models.py         the events table (queue + audit + dead-letter, all in one)
+  sources.py        per-sender adapters — signature scheme, where the ID lives
+  destinations.py   per-destination URL + which transform to use
+  transformer.py    the {{placeholder}} engine
+  db.py, config.py  connection + settings
+worker.py           the delivery worker
+transforms/         JSON templates (config, not code)
+tests/              pytest
+alembic/            migrations
+Dockerfile          one image, API and worker both run from it
+docker-compose.yml  full local stack
+render.yaml         deploy config
+start.sh            container entrypoint
 ```
